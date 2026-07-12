@@ -1,0 +1,236 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The vendored engine must stay byte-identical to upstream at the
+  # recorded ref: fetched-from-upstream, vendored, and recorded hashes
+  # must all be equal.
+  sync-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vendored engine matches upstream at the recorded ref
+        shell: bash
+        run: |
+          repo=$(sed -n 's/^repo=//p' verifier/UPSTREAM)
+          ref=$(sed -n 's/^ref=//p' verifier/UPSTREAM)
+          path=$(sed -n 's/^path=//p' verifier/UPSTREAM)
+          recorded=$(sed -n 's/^sha256=//p' verifier/UPSTREAM)
+          echo "upstream: $repo@$ref $path"
+          curl -fsSL "https://raw.githubusercontent.com/$repo/$ref/$path" -o /tmp/upstream-engine.py
+          fetched=$(sha256sum /tmp/upstream-engine.py | cut -d' ' -f1)
+          vendored=$(sha256sum verifier/forgeproof.py | cut -d' ' -f1)
+          echo "recorded: $recorded"
+          echo "fetched:  $fetched"
+          echo "vendored: $vendored"
+          test "$fetched" = "$recorded" || { echo "::error::upstream file at $ref does not match the recorded sha256"; exit 1; }
+          test "$vendored" = "$recorded" || { echo "::error::vendored verifier/forgeproof.py has drifted from the recorded sha256"; exit 1; }
+          echo "sync-check OK"
+
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run glue unit tests
+        shell: bash
+        run: |
+          PY=$(command -v python3 || command -v python)
+          "$PY" scripts/test_run_verify.py
+
+  self-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy v110 fixture
+        shell: bash
+        run: |
+          mkdir -p scratch-v110/.forgeproof scratch-v110/src
+          cp fixtures/v110/chain-998.json fixtures/v110/issue-998.rpack scratch-v110/.forgeproof/
+          cp fixtures/v110/src/example2.py scratch-v110/src/
+      - name: Verify v110
+        id: v110
+        uses: ./
+        with:
+          project-root: scratch-v110
+          comment: "false"
+      - name: Assert v110 green
+        shell: bash
+        env:
+          VERIFIED: ${{ steps.v110.outputs.verified }}
+          COMPLETE: ${{ steps.v110.outputs.complete }}
+        run: |
+          test "$VERIFIED" = "true" || { echo "::error::v110 verified='$VERIFIED', expected true"; exit 1; }
+          test "$COMPLETE" = "true" || { echo "::error::v110 complete='$COMPLETE', expected true"; exit 1; }
+
+      - name: Deploy v101 fixture
+        shell: bash
+        run: |
+          mkdir -p scratch-v101/.forgeproof scratch-v101/src
+          cp fixtures/v101/chain-999.json fixtures/v101/issue-999.rpack scratch-v101/.forgeproof/
+          cp fixtures/v101/src/example.py scratch-v101/src/
+      - name: Verify v101
+        id: v101
+        uses: ./
+        with:
+          project-root: scratch-v101
+          comment: "false"
+      - name: Assert v101 green
+        shell: bash
+        env:
+          VERIFIED: ${{ steps.v101.outputs.verified }}
+          COMPLETE: ${{ steps.v101.outputs.complete }}
+        run: |
+          test "$VERIFIED" = "true" || { echo "::error::v101 verified='$VERIFIED', expected true"; exit 1; }
+          test "$COMPLETE" = "true" || { echo "::error::v101 complete='$COMPLETE', expected true"; exit 1; }
+
+  tamper-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - artifact-byte-flip
+          - chain-block-edit
+          - signature-armor-mutation
+          - bundle-field-edit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy v110 and mutate
+        shell: bash
+        env:
+          CASE: ${{ matrix.case }}
+        run: |
+          mkdir -p scratch/.forgeproof scratch/src
+          cp fixtures/v110/chain-998.json fixtures/v110/issue-998.rpack scratch/.forgeproof/
+          cp fixtures/v110/src/example2.py scratch/src/
+          PY=$(command -v python3 || command -v python)
+          "$PY" - "$CASE" <<'PYEOF'
+          import json, sys
+          from pathlib import Path
+
+          case = sys.argv[1]
+          root = Path("scratch")
+          if case == "artifact-byte-flip":
+              p = root / "src" / "example2.py"
+              data = bytearray(p.read_bytes())
+              data[0] ^= 0xFF
+              p.write_bytes(bytes(data))
+          elif case == "chain-block-edit":
+              p = root / ".forgeproof" / "chain-998.json"
+              chain = json.loads(p.read_text(encoding="utf-8"))
+              chain[1]["data"]["path"] = "src/evil.py"
+              p.write_text(json.dumps(chain, indent=2), encoding="utf-8")
+          elif case == "signature-armor-mutation":
+              p = root / ".forgeproof" / "issue-998.rpack"
+              bundle = json.loads(p.read_text(encoding="utf-8"))
+              lines = bundle["signature"].splitlines()
+              body = [i for i, l in enumerate(lines)
+                      if l and not l.startswith("-----")]
+              mid = body[len(body) // 2]
+              lines[mid] = lines[mid][::-1]
+              bundle["signature"] = "\n".join(lines) + "\n"
+              p.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+          elif case == "bundle-field-edit":
+              p = root / ".forgeproof" / "issue-998.rpack"
+              bundle = json.loads(p.read_text(encoding="utf-8"))
+              bundle["issue"]["title"] = str(bundle["issue"].get("title", "")) + " (edited)"
+              p.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+          else:
+              raise SystemExit(f"unknown case: {case}")
+          print(f"mutated: {case}")
+          PYEOF
+      - name: Verify mutated deployment (must go red)
+        id: tamper
+        continue-on-error: true
+        uses: ./
+        with:
+          project-root: scratch
+          comment: "false"
+      - name: Assert red
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.tamper.outcome }}
+          VERIFIED: ${{ steps.tamper.outputs.verified }}
+        run: |
+          test "$OUTCOME" = "failure" || { echo "::error::expected outcome=failure, got '$OUTCOME'"; exit 1; }
+          test "$VERIFIED" = "false" || { echo "::error::expected verified=false, got '$VERIFIED'"; exit 1; }
+
+  strict-vs-lenient:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy v110 without its artifact
+        shell: bash
+        run: |
+          mkdir -p scratch/.forgeproof
+          cp fixtures/v110/chain-998.json fixtures/v110/issue-998.rpack scratch/.forgeproof/
+      - name: Lenient run (must pass, incomplete)
+        id: lenient
+        uses: ./
+        with:
+          project-root: scratch
+          strict: "false"
+          comment: "false"
+      - name: Assert lenient outputs
+        shell: bash
+        env:
+          VERIFIED: ${{ steps.lenient.outputs.verified }}
+          COMPLETE: ${{ steps.lenient.outputs.complete }}
+        run: |
+          test "$VERIFIED" = "true" || { echo "::error::lenient verified='$VERIFIED', expected true"; exit 1; }
+          test "$COMPLETE" = "false" || { echo "::error::lenient complete='$COMPLETE', expected false"; exit 1; }
+      - name: Strict run (must go red)
+        id: strict
+        continue-on-error: true
+        uses: ./
+        with:
+          project-root: scratch
+          strict: "true"
+          comment: "false"
+      - name: Assert strict failed
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.strict.outcome }}
+        run: |
+          test "$OUTCOME" = "failure" || { echo "::error::expected outcome=failure, got '$OUTCOME'"; exit 1; }
+
+  no-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create empty scratch dir
+        shell: bash
+        run: mkdir -p empty-scratch
+      - name: Required run (must go red)
+        id: required
+        continue-on-error: true
+        uses: ./
+        with:
+          project-root: empty-scratch
+          require-bundle: "true"
+          comment: "false"
+      - name: Assert required failed
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.required.outcome }}
+        run: |
+          test "$OUTCOME" = "failure" || { echo "::error::expected outcome=failure, got '$OUTCOME'"; exit 1; }
+      - name: Lenient run (must pass)
+        uses: ./
+        with:
+          project-root: empty-scratch
+          require-bundle: "false"
+          comment: "false"
