@@ -55,16 +55,28 @@ outputs:
     description: First matched bundle path, relative to project-root.
     value: ${{ steps.verify.outputs.bundle-path }}
   report:
-    description: The markdown verification report.
+    description: >-
+      The markdown verification report. Ends with the hidden
+      "<!-- forgeproof-verify -->" marker used for PR-comment upsert.
     value: ${{ steps.verify.outputs.report }}
+  should-fail:
+    description: >-
+      "true" iff the enforce step fails the check — i.e. a bundle failed
+      verification, or no bundle matched while require-bundle is "true".
+    value: ${{ steps.verify.outputs.should-fail }}
+  summary-bytes:
+    description: >-
+      Number of bytes the verify step appended to the job summary
+      (always > 0 when the step ran inside GitHub Actions).
+    value: ${{ steps.verify.outputs.summary-bytes }}
 
 runs:
   using: composite
   steps:
     # Never fails: writes outputs (verified/complete/bundle-path/report/
-    # should-fail) and the job summary so the report reaches the user even
-    # when the check must go red. The enforce step at the end turns
-    # should-fail into the actual red X.
+    # should-fail/summary-bytes) and the job summary so the report reaches
+    # the user even when the check must go red. The enforce step at the
+    # end turns should-fail into the actual red X.
     - id: verify
       shell: bash
       env:
@@ -91,16 +103,34 @@ runs:
         set +e
         body_file=$(mktemp)
         printf '%s\n' "$REPORT" > "$body_file"
-        # Prefer editing our previous comment to avoid spamming the PR;
-        # older gh releases lack --edit-last/--create-if-none, so fall
-        # back progressively to a plain comment.
-        gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-          --edit-last --create-if-none --body-file "$body_file" \
-        || gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-          --edit-last --body-file "$body_file" \
-        || gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-          --body-file "$body_file" \
-        || echo "::notice::forgeproof-verify: comment skipped (likely read-only token on a fork PR) — report is in the job summary"
+        # Marker-based upsert: find our previous report comment (hidden
+        # marker in the body AND authored by this token's identity) and
+        # edit it in place; otherwise post a new comment. gh's --edit-last
+        # is NOT used — it targets the token's last comment of any kind
+        # and would clobber an unrelated bot comment.
+        marker='<!-- forgeproof-verify -->'
+        login=$(gh api user --jq .login 2>/dev/null)
+        # The default installation token cannot call /user; its comments
+        # are authored by github-actions[bot].
+        [ -n "$login" ] || login="github-actions[bot]"
+        comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+          --paginate \
+          --jq ".[] | select((.body | contains(\"$marker\")) and .user.login == \"$login\") | .id" \
+          2>/dev/null | tail -n 1)
+        if [ -n "$comment_id" ]; then
+          if gh api -X PATCH \
+               "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" \
+               -F body=@"$body_file" > /dev/null; then
+            echo "forgeproof-verify: updated existing report comment $comment_id"
+            exit 0
+          fi
+        fi
+        if gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+             --body-file "$body_file"; then
+          echo "forgeproof-verify: posted new report comment"
+          exit 0
+        fi
+        echo "::notice::forgeproof-verify: comment skipped (likely read-only token on a fork PR) — report is in the job summary"
         exit 0
 
     - id: enforce
@@ -108,8 +138,11 @@ runs:
       env:
         SHOULD_FAIL: ${{ steps.verify.outputs.should-fail }}
       run: |
-        if [ "$SHOULD_FAIL" = "true" ]; then
-          echo "::error::ForgeProof verification failed — see the job summary (and PR comment) for the audit report"
+        # Fail-closed shape: only an explicit "false" passes. An empty,
+        # missing, or mangled output must read as red, even if composite
+        # step-abort semantics ever change.
+        if [ "$SHOULD_FAIL" != "false" ]; then
+          echo "::error::ForgeProof verification failed (should-fail='$SHOULD_FAIL') — see the job summary (and PR comment) for the audit report"
           exit 1
         fi
         echo "forgeproof-verify: enforcement passed"

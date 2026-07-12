@@ -52,10 +52,36 @@ That is the whole integration for the default layout (bundles under
 
 | Output | Description |
 |---|---|
-| `verified` | `"true"` iff every matched bundle verified. With zero bundles and `require-bundle: "false"`, vacuously `"true"`. |
+| `verified` | `"true"` iff every matched bundle verified. See [the vacuous case](#the-vacuous-case) below. |
 | `complete` | `"true"` iff every matched bundle was complete: provenance chain and all recorded artifacts present in the checkout. |
 | `bundle-path` | First matched bundle, relative to `project-root`. Empty when none matched. |
-| `report` | The full markdown audit report. |
+| `report` | The full markdown audit report. Ends with a hidden `<!-- forgeproof-verify -->` marker (see [PR comments](#pr-comments)). |
+| `should-fail` | `"true"` iff the enforce step fails the check: a bundle failed verification, or none matched while `require-bundle` is `"true"`. |
+| `summary-bytes` | Bytes the verify step appended to the job summary (always > 0 inside GitHub Actions). |
+
+> **Warning — treat `bundle-path` and `report` as attacker-influenced on
+> fork PRs.** Bundle file names and bundle contents come from the PR
+> branch. Never interpolate these outputs into a script with `${{ }}`
+> (classic expression injection):
+>
+> ```yaml
+> # UNSAFE — do not do this:
+> #   run: echo "${{ steps.fp.outputs.report }}"
+>
+> # Safe — pass through env instead:
+> - name: Use the report
+>   env:
+>     REPORT: ${{ steps.fp.outputs.report }}
+>   run: printf '%s\n' "$REPORT"
+> ```
+
+### The vacuous case
+
+With zero matched bundles and `require-bundle: "false"`, nothing was
+verified: the action passes with `verified: "true"` (vacuously — there was
+no bundle to fail) and `complete: "false"`. Gate on `complete` if your
+workflow must distinguish "verified provenance" from "no provenance
+present".
 
 ## Fork PRs
 
@@ -64,6 +90,15 @@ verify and enforce steps only need `contents: read`. The default token on a
 fork PR is read-only, so the PR *comment* is skipped (with a workflow
 notice) — the report is always available in the job summary regardless.
 This action never uses `pull_request_target`.
+
+## PR comments
+
+The report comment is upserted, not spammed: every report ends with a
+hidden `<!-- forgeproof-verify -->` HTML marker, and the comment step
+looks for an existing PR comment containing that marker authored by the
+token's identity (`github-actions[bot]` for the default token) and edits
+it in place; only if none exists does it post a new comment. Comment
+failures never fail the check.
 
 ## Strict semantics: integrity vs completeness
 
