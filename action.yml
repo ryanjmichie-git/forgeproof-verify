@@ -108,22 +108,51 @@ runs:
         # edit it in place; otherwise post a new comment. gh's --edit-last
         # is NOT used — it targets the token's last comment of any kind
         # and would clobber an unrelated bot comment.
-        marker='<!-- forgeproof-verify -->'
-        login=$(gh api user --jq .login 2>/dev/null)
-        # The default installation token cannot call /user; its comments
-        # are authored by github-actions[bot].
-        [ -n "$login" ] || login="github-actions[bot]"
-        comment_id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-          --paginate \
-          --jq ".[] | select((.body | contains(\"$marker\")) and .user.login == \"$login\") | .id" \
-          2>/dev/null | tail -n 1)
+        #
+        # The lookup and edit go through GraphQL, NOT the REST
+        # /issues/*/comments routes: with the default workflow token
+        # scoped `pull-requests: write` and no `issues` permission, REST
+        # GET /repos/.../issues/N/comments returns 403 "Resource not
+        # accessible by integration" (the route maps to the Issues
+        # permission), so a REST lookup silently never matches and every
+        # run posts a fresh comment. GraphQL pullRequest.comments maps to
+        # the same pull-requests permission that lets us post, and
+        # viewerDidAuthor identifies our own comments without calling
+        # /user (which installation tokens cannot do). Comments beyond
+        # the most recent 100 are not searched — worst case a new comment
+        # is posted, which is then the most recent.
+        owner="${GITHUB_REPOSITORY%%/*}"
+        name="${GITHUB_REPOSITORY#*/}"
+        ids=$(gh api graphql \
+          -f owner="$owner" -f name="$name" -F pr="$PR_NUMBER" \
+          -f query='query($owner: String!, $name: String!, $pr: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $pr) {
+                comments(last: 100) {
+                  nodes { id body viewerDidAuthor }
+                }
+              }
+            }
+          }' \
+          --jq '.data.repository.pullRequest.comments.nodes[]
+                | select(.viewerDidAuthor
+                         and (.body | contains("<!-- forgeproof-verify -->")))
+                | .id')
+        count=$(printf '%s\n' "$ids" | grep -c .)
+        comment_id=$(printf '%s\n' "$ids" | tail -n 1)
+        echo "forgeproof-verify: comment upsert: $count candidate comment(s) found"
         if [ -n "$comment_id" ]; then
-          if gh api -X PATCH \
-               "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" \
-               -F body=@"$body_file" > /dev/null; then
+          if gh api graphql \
+               -f id="$comment_id" -F body=@"$body_file" \
+               -f query='mutation($id: ID!, $body: String!) {
+                 updateIssueComment(input: {id: $id, body: $body}) {
+                   issueComment { url }
+                 }
+               }' > /dev/null; then
             echo "forgeproof-verify: updated existing report comment $comment_id"
             exit 0
           fi
+          echo "forgeproof-verify: updating comment $comment_id failed; posting a new comment instead"
         fi
         if gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
              --body-file "$body_file"; then
