@@ -1,0 +1,115 @@
+name: ForgeProof Verify
+description: >-
+  Verify ForgeProof .rpack provenance bundles (Ed25519-signed, SHA-256
+  hash-chained audit trails for AI-generated code) on pull requests.
+author: Ryan Michie
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  bundle:
+    description: >-
+      Glob for .rpack bundles, relative to project-root. Every matched
+      bundle must verify.
+    default: ".forgeproof/*.rpack"
+  strict:
+    description: >-
+      When "true", missing evidence (provenance chain or recorded
+      artifacts not present in the checkout) fails verification, not just
+      tampered evidence.
+    default: "true"
+  require-bundle:
+    description: >-
+      When "true", the check fails if no bundle matches the glob.
+    default: "true"
+  comment:
+    description: >-
+      When "true", post the verification report as a PR comment on
+      pull_request events. Comment failures (e.g. read-only token on a
+      fork PR) never fail the check — the report is always in the job
+      summary.
+    default: "true"
+  project-root:
+    description: >-
+      Directory the bundle glob and recorded artifact paths anchor to.
+    default: "."
+  github-token:
+    description: >-
+      Token used to post the PR comment. Needs pull-requests write
+      permission; not needed when comment is "false".
+    default: ${{ github.token }}
+
+outputs:
+  verified:
+    description: >-
+      "true" iff every matched bundle verified (with no bundle matched and
+      require-bundle "false", this is vacuously "true").
+    value: ${{ steps.verify.outputs.verified }}
+  complete:
+    description: >-
+      "true" iff every matched bundle was complete — provenance chain and
+      all recorded artifacts present alongside the bundle.
+    value: ${{ steps.verify.outputs.complete }}
+  bundle-path:
+    description: First matched bundle path, relative to project-root.
+    value: ${{ steps.verify.outputs.bundle-path }}
+  report:
+    description: The markdown verification report.
+    value: ${{ steps.verify.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    # Never fails: writes outputs (verified/complete/bundle-path/report/
+    # should-fail) and the job summary so the report reaches the user even
+    # when the check must go red. The enforce step at the end turns
+    # should-fail into the actual red X.
+    - id: verify
+      shell: bash
+      env:
+        INPUT_BUNDLE: ${{ inputs.bundle }}
+        INPUT_STRICT: ${{ inputs.strict }}
+        INPUT_REQUIRE_BUNDLE: ${{ inputs.require-bundle }}
+        INPUT_PROJECT_ROOT: ${{ inputs.project-root }}
+      run: |
+        PY=$(command -v python3 || command -v python)
+        export VERIFIER="$GITHUB_ACTION_PATH/verifier/forgeproof.py"
+        "$PY" "$GITHUB_ACTION_PATH/scripts/run_verify.py"
+
+    # Failure tolerated by design: on fork PRs the default token is
+    # read-only and the comment API returns 403 — the check result and the
+    # job-summary report must still land.
+    - name: Post report as PR comment
+      if: inputs.comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPORT: ${{ steps.verify.outputs.report }}
+      run: |
+        set +e
+        body_file=$(mktemp)
+        printf '%s\n' "$REPORT" > "$body_file"
+        # Prefer editing our previous comment to avoid spamming the PR;
+        # older gh releases lack --edit-last/--create-if-none, so fall
+        # back progressively to a plain comment.
+        gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+          --edit-last --create-if-none --body-file "$body_file" \
+        || gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+          --edit-last --body-file "$body_file" \
+        || gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+          --body-file "$body_file" \
+        || echo "::notice::forgeproof-verify: comment skipped (likely read-only token on a fork PR) — report is in the job summary"
+        exit 0
+
+    - id: enforce
+      shell: bash
+      env:
+        SHOULD_FAIL: ${{ steps.verify.outputs.should-fail }}
+      run: |
+        if [ "$SHOULD_FAIL" = "true" ]; then
+          echo "::error::ForgeProof verification failed — see the job summary (and PR comment) for the audit report"
+          exit 1
+        fi
+        echo "forgeproof-verify: enforcement passed"
