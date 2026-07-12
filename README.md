@@ -95,10 +95,11 @@ This action never uses `pull_request_target`.
 
 The report comment is upserted, not spammed: every report ends with a
 hidden `<!-- forgeproof-verify -->` HTML marker, and the comment step
-looks for an existing PR comment containing that marker authored by the
-token's identity (`github-actions[bot]` for the default token) and edits
-it in place; only if none exists does it post a new comment. Comment
-failures never fail the check.
+looks (via GraphQL, among the PR's last 100 comments) for an existing
+comment that carries the marker and was authored by the token's own
+identity, then edits it in place; only if none exists does it post a new
+comment. The whole flow needs only `pull-requests: write` — no `issues`
+permission. Comment failures never fail the check.
 
 ## Strict semantics: integrity vs completeness
 
