@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ForgeProof — Ed25519-signed SHA-256 hash chain provenance engine.
 
-Python 3.11+ stdlib only. No pip dependencies.
+Pythoo 3.11+ stdlib only. No pip dependencies.
 Cryptographic signing via ssh-keygen (OpenSSH 8.0+).
 
 Subcommands:
