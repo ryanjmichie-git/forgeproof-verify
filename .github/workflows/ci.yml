@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # The vendored engine must stay byte-identical to upstream at the
   # recorded ref: fetched-from-upstream, vendored, and recorded hashes
@@ -71,9 +74,11 @@ jobs:
         env:
           VERIFIED: ${{ steps.v110.outputs.verified }}
           COMPLETE: ${{ steps.v110.outputs.complete }}
+          SUMMARY_BYTES: ${{ steps.v110.outputs.summary-bytes }}
         run: |
           test "$VERIFIED" = "true" || { echo "::error::v110 verified='$VERIFIED', expected true"; exit 1; }
           test "$COMPLETE" = "true" || { echo "::error::v110 complete='$COMPLETE', expected true"; exit 1; }
+          test "$SUMMARY_BYTES" -gt 0 2>/dev/null || { echo "::error::v110 summary-bytes='$SUMMARY_BYTES', expected > 0 (job summary not written)"; exit 1; }
 
       - name: Deploy v101 fixture
         shell: bash
@@ -204,8 +209,12 @@ jobs:
         shell: bash
         env:
           OUTCOME: ${{ steps.strict.outcome }}
+          VERIFIED: ${{ steps.strict.outputs.verified }}
+          SHOULD_FAIL: ${{ steps.strict.outputs.should-fail }}
         run: |
           test "$OUTCOME" = "failure" || { echo "::error::expected outcome=failure, got '$OUTCOME'"; exit 1; }
+          test "$VERIFIED" = "false" || { echo "::error::strict verified='$VERIFIED', expected false"; exit 1; }
+          test "$SHOULD_FAIL" = "true" || { echo "::error::strict should-fail='$SHOULD_FAIL', expected true"; exit 1; }
 
   no-bundle:
     runs-on: ubuntu-latest
@@ -226,11 +235,26 @@ jobs:
         shell: bash
         env:
           OUTCOME: ${{ steps.required.outcome }}
+          VERIFIED: ${{ steps.required.outputs.verified }}
+          SHOULD_FAIL: ${{ steps.required.outputs.should-fail }}
         run: |
           test "$OUTCOME" = "failure" || { echo "::error::expected outcome=failure, got '$OUTCOME'"; exit 1; }
+          test "$VERIFIED" = "false" || { echo "::error::required verified='$VERIFIED', expected false"; exit 1; }
+          test "$SHOULD_FAIL" = "true" || { echo "::error::required should-fail='$SHOULD_FAIL', expected true"; exit 1; }
       - name: Lenient run (must pass)
+        id: lenient
         uses: ./
         with:
           project-root: empty-scratch
           require-bundle: "false"
           comment: "false"
+      - name: Assert lenient vacuous pass
+        shell: bash
+        env:
+          VERIFIED: ${{ steps.lenient.outputs.verified }}
+          COMPLETE: ${{ steps.lenient.outputs.complete }}
+          SHOULD_FAIL: ${{ steps.lenient.outputs.should-fail }}
+        run: |
+          test "$VERIFIED" = "true" || { echo "::error::lenient verified='$VERIFIED', expected vacuous true"; exit 1; }
+          test "$COMPLETE" = "false" || { echo "::error::lenient complete='$COMPLETE', expected false"; exit 1; }
+          test "$SHOULD_FAIL" = "false" || { echo "::error::lenient should-fail='$SHOULD_FAIL', expected false"; exit 1; }

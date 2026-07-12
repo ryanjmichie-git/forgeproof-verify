@@ -30,7 +30,10 @@ FIXTURES = {
              "artifact": "src/example.py"},
 }
 
-OUTPUT_KEYS = {"verified", "complete", "bundle-path", "report", "should-fail"}
+OUTPUT_KEYS = {"verified", "complete", "bundle-path", "report",
+               "should-fail", "summary-bytes"}
+
+COMMENT_MARKER = "<!-- forgeproof-verify -->"
 
 
 def deploy(name: str, root: Path) -> None:
@@ -69,7 +72,7 @@ def parse_outputs(text: str) -> dict[str, str]:
 
 
 def run_glue(project_root, bundle=None, strict=None, require_bundle=None,
-             verifier=None, workdir=None):
+             verifier=None, workdir=None, extra_env=None):
     """Run the glue with the action's env contract. Returns
     (proc, outputs, summary)."""
     with tempfile.TemporaryDirectory() as td:
@@ -81,7 +84,7 @@ def run_glue(project_root, bundle=None, strict=None, require_bundle=None,
         env = os.environ.copy()
         for key in ("INPUT_BUNDLE", "INPUT_STRICT", "INPUT_REQUIRE_BUNDLE",
                     "INPUT_PROJECT_ROOT", "VERIFIER", "GITHUB_OUTPUT",
-                    "GITHUB_STEP_SUMMARY"):
+                    "GITHUB_STEP_SUMMARY", "FP_TEST_FORCE_CRASH"):
             env.pop(key, None)
         env["INPUT_PROJECT_ROOT"] = str(project_root)
         env["VERIFIER"] = str(verifier if verifier is not None else VERIFIER)
@@ -93,6 +96,8 @@ def run_glue(project_root, bundle=None, strict=None, require_bundle=None,
             env["INPUT_STRICT"] = strict
         if require_bundle is not None:
             env["INPUT_REQUIRE_BUNDLE"] = require_bundle
+        if extra_env:
+            env.update(extra_env)
 
         proc = subprocess.run(
             [sys.executable, str(RUN_VERIFY)],
@@ -127,8 +132,14 @@ def test_green_v110():
         assert outputs["should-fail"] == "false", outputs
         assert outputs["bundle-path"] == ".forgeproof/issue-998.rpack", outputs
         assert "VERIFIED" in outputs["report"], outputs["report"][:400]
+        assert outputs["report"].rstrip().endswith(COMMENT_MARKER), \
+            outputs["report"][-120:]
+        assert int(outputs["summary-bytes"]) > 0, outputs
+        assert int(outputs["summary-bytes"]) == len(
+            summary.encode("utf-8")), outputs
         assert "VERIFIED" in summary
         assert "PASS" in proc.stdout
+        assert "summary written:" in proc.stdout
 
 
 def test_green_v101():
@@ -255,6 +266,45 @@ def test_engine_error_unparseable():
         assert "VERIFICATION ERROR" in summary
 
 
+def test_empty_string_strict_defaults_true():
+    # The action always sets INPUT_*, so "" (e.g. an unset ${{ vars.X }})
+    # must behave as the default (strict=true), never fail open.
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        deploy("v110", root)
+        (root / "src" / "example2.py").unlink()  # strict-only failure
+        _, outputs, _ = run_glue(root, strict="")
+        assert outputs["verified"] == "false", outputs
+        assert outputs["should-fail"] == "true", outputs
+
+
+def test_empty_string_require_bundle_defaults_true():
+    with tempfile.TemporaryDirectory() as td:
+        _, outputs, _ = run_glue(Path(td), require_bundle="")
+        assert outputs["verified"] == "false", outputs
+        assert outputs["should-fail"] == "true", outputs
+
+
+def test_glue_crash_fails_closed():
+    # FP_TEST_FORCE_CRASH=1 makes main() raise after input parsing; the
+    # top-level handler must still ship a report and should-fail=true,
+    # and the process must still exit 0 (run_glue asserts that).
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        deploy("v110", root)
+        _, outputs, summary = run_glue(
+            root, extra_env={"FP_TEST_FORCE_CRASH": "1"})
+        assert_all_outputs(outputs)
+        assert outputs["verified"] == "false", outputs
+        assert outputs["complete"] == "false", outputs
+        assert outputs["should-fail"] == "true", outputs
+        assert "INTERNAL ERROR" in outputs["report"], outputs["report"][:400]
+        assert "RuntimeError" in outputs["report"], outputs["report"][:400]
+        assert "INTERNAL ERROR" in summary
+        assert outputs["report"].rstrip().endswith(COMMENT_MARKER), \
+            outputs["report"][-120:]
+
+
 TESTS = [
     test_green_v110,
     test_green_v101,
@@ -266,6 +316,9 @@ TESTS = [
     test_multiple_bundles_one_tampered,
     test_path_with_spaces,
     test_engine_error_unparseable,
+    test_empty_string_strict_defaults_true,
+    test_empty_string_require_bundle_defaults_true,
+    test_glue_crash_fails_closed,
 ]
 
 

@@ -20,8 +20,16 @@ Outputs written to GITHUB_OUTPUT:
     complete      "true" iff every matched bundle was complete (chain +
                   all artifacts present)
     bundle-path   first matched bundle, relative to the project root
-    report        aggregated markdown report (heredoc syntax)
+    report        aggregated markdown report (heredoc syntax); always ends
+                  with the hidden COMMENT_MARKER used for comment upsert
     should-fail   "true" iff the enforce step must fail the job
+    summary-bytes bytes appended to GITHUB_STEP_SUMMARY ("0" when unset)
+
+Fail-closed guarantees: boolean inputs treat the empty string as unset
+(the action always sets the INPUT_* env vars, so "" must mean "use the
+default"), and any glue crash still writes should-fail=true plus a
+fallback report before exiting 0 — the enforce step, not this script's
+exit code, turns the check red.
 
 The per-bundle markdown report comes from the engine itself
 (``verify --format markdown``) — it is the single source of truth and is
@@ -35,6 +43,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 import uuid
 from pathlib import Path
 
@@ -42,9 +51,27 @@ PLUGIN_URL = "https://github.com/ryanjmichie-git/forgeproof-plugin"
 DEFAULT_PATTERN = ".forgeproof/*.rpack"
 STDERR_EXCERPT_LIMIT = 2000
 
+# Hidden HTML comment appended to every report: the action's PR-comment
+# step finds its previous comment by this marker (instead of gh's
+# --edit-last, which targets the *bot's* last comment and would clobber
+# an unrelated bot comment posted with the same token).
+COMMENT_MARKER = "<!-- forgeproof-verify -->"
+
 
 def env_flag(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in ("true", "1", "yes")
+    # The composite action always sets the INPUT_* env vars, so an empty
+    # string means "input not provided" and must fall back to the default
+    # — an unset ${{ vars.X }} must never silently disable a safety
+    # switch (fail closed).
+    return (os.environ.get(name, "").strip() or default).lower() in (
+        "true", "1", "yes")
+
+
+def with_marker(report: str) -> str:
+    """Append the comment-upsert marker (once) to a finished report."""
+    if COMMENT_MARKER in report:
+        return report
+    return report + "\n\n" + COMMENT_MARKER
 
 
 def md_inline(value: object) -> str:
@@ -208,12 +235,45 @@ def write_outputs(outputs: dict[str, str]) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
-def write_summary(report: str) -> None:
+def write_summary(report: str) -> int:
+    """Append the report to the job summary; return bytes written."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
-        return
+        return 0
+    data = report + "\n"
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(report + "\n")
+        fh.write(data)
+    return len(data.encode("utf-8"))
+
+
+def emit(report: str, *, verified: bool, complete: bool, bundle_path: str,
+         should_fail: bool) -> None:
+    """Single exit path for every result shape: marker the report, write
+    the job summary, then write all six step outputs."""
+    report = with_marker(report)
+    summary_bytes = write_summary(report)
+    print(f"forgeproof-verify: summary written: {summary_bytes} bytes")
+    write_outputs({
+        "verified": "true" if verified else "false",
+        "complete": "true" if complete else "false",
+        "bundle-path": bundle_path,
+        "should-fail": "true" if should_fail else "false",
+        "summary-bytes": str(summary_bytes),
+        "report": report,
+    })
+
+
+def crash_report(exc: BaseException) -> str:
+    detail = f"{type(exc).__name__}: {md_inline(exc)}"
+    return "\n".join([
+        "## ❌ FORGEPROOF-VERIFY INTERNAL ERROR",
+        "",
+        "The verification glue crashed before completing, so this check "
+        "fails closed. This is a bug in the action, not evidence about "
+        "the bundle.",
+        "",
+        md_fence(detail),
+    ])
 
 
 def main() -> int:
@@ -231,6 +291,11 @@ def main() -> int:
     print(f"forgeproof-verify: pattern={pattern!r} project-root={root_input!r} "
           f"strict={strict} require-bundle={require_bundle}")
 
+    if os.environ.get("FP_TEST_FORCE_CRASH") == "1":
+        # Test-only hook: the unit suite sets this to exercise the
+        # top-level fail-closed crash handler without monkeypatching.
+        raise RuntimeError("forced crash (FP_TEST_FORCE_CRASH=1)")
+
     if not verifier or not Path(verifier).is_file():
         report = "\n".join([
             "## ❌ VERIFICATION ERROR",
@@ -239,27 +304,18 @@ def main() -> int:
             "This is a bug in the action itself.",
         ])
         print("forgeproof-verify: FATAL: verifier engine not found")
-        write_outputs({"verified": "false", "complete": "false",
-                       "bundle-path": "", "should-fail": "true",
-                       "report": report})
-        write_summary(report)
+        emit(report, verified=False, complete=False, bundle_path="",
+             should_fail=True)
         return 0
 
     bundles = find_bundles(root, pattern)
 
     if not bundles:
         report = no_bundle_report(pattern, root_input, require_bundle)
-        should_fail = require_bundle
         print(f"forgeproof-verify: no bundle matched "
-              f"({'FAIL' if should_fail else 'pass — not required'})")
-        write_outputs({
-            "verified": "false" if require_bundle else "true",
-            "complete": "false",
-            "bundle-path": "",
-            "should-fail": "true" if should_fail else "false",
-            "report": report,
-        })
-        write_summary(report)
+              f"({'FAIL' if require_bundle else 'pass — not required'})")
+        emit(report, verified=not require_bundle, complete=False,
+             bundle_path="", should_fail=require_bundle)
         return 0
 
     print(f"forgeproof-verify: {len(bundles)} bundle(s) matched")
@@ -285,16 +341,26 @@ def main() -> int:
           f"{'PASS' if all_verified else 'FAIL'} "
           f"({'complete' if all_complete else 'incomplete'})")
 
-    write_outputs({
-        "verified": "true" if all_verified else "false",
-        "complete": "true" if all_complete else "false",
-        "bundle-path": bundle_rel(bundles[0], root),
-        "should-fail": "false" if all_verified else "true",
-        "report": report,
-    })
-    write_summary(report)
+    emit(report, verified=all_verified, complete=all_complete,
+         bundle_path=bundle_rel(bundles[0], root),
+         should_fail=not all_verified)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    except Exception as exc:  # fail closed, but the report must still ship
+        try:
+            traceback.print_exc()
+            emit(crash_report(exc), verified=False, complete=False,
+                 bundle_path="", should_fail=True)
+            print("forgeproof-verify: INTERNAL ERROR "
+                  f"({type(exc).__name__}) — failing closed via should-fail")
+            code = 0
+        except Exception:
+            # Cannot even write outputs: abort the step nonzero, which
+            # also reads as red (composite abort) — still fail-closed.
+            traceback.print_exc()
+            code = 1
+    sys.exit(code)
