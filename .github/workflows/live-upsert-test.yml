@@ -1,0 +1,51 @@
+# TEMPORARY workflow — exists only on the test/comment-upsert-live branch
+# to live-verify the marker-based comment upsert with the real workflow
+# installation token. Mirrors the plugin E2E permission grant exactly
+# (contents: read + pull-requests: write, no issues permission).
+name: live-upsert-test
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  live-upsert:
+    runs-on: ubuntu-latest
+    if: github.head_ref == 'test/comment-upsert-live'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diagnose REST vs GraphQL comment routes (root-cause evidence)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set +e
+          echo "--- gh api user (installation token) ---"
+          gh api user --jq .login
+          echo "exit=$?"
+          echo "--- OLD lookup route: REST GET /issues/N/comments ---"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --paginate --jq '.[].id'
+          echo "exit=$?"
+          echo "--- NEW lookup route: GraphQL pullRequest.comments ---"
+          gh api graphql \
+            -f owner="${GITHUB_REPOSITORY%%/*}" -f name="${GITHUB_REPOSITORY#*/}" -F pr="$PR_NUMBER" \
+            -f query='query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { comments(last: 100) { nodes { id viewerDidAuthor } } } } }'
+          echo "exit=$?"
+          exit 0
+
+      - name: Deploy v110 fixture
+        shell: bash
+        run: |
+          mkdir -p scratch/.forgeproof scratch/src
+          cp fixtures/v110/chain-998.json fixtures/v110/issue-998.rpack scratch/.forgeproof/
+          cp fixtures/v110/src/example2.py scratch/src/
+
+      - name: Run action with comments enabled
+        uses: ./
+        with:
+          project-root: scratch
