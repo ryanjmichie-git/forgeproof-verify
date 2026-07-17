@@ -1,7 +1,7 @@
 name: ForgeProof Verify
 description: >-
-  Verify ForgeProof .rpack provenance bundles (Ed25519-signed, SHA-256
-  hash-chained audit trails for AI-generated code) on pull requests.
+  Verify ForgeProof .rpack provenance bundles (Ed25519-signed audit trails
+  for AI-generated code) on pull requests.
 author: Ryan Michie
 branding:
   icon: shield
