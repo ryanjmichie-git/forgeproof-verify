@@ -111,6 +111,7 @@ jobs:
           - chain-block-edit
           - signature-armor-mutation
           - bundle-field-edit
+          - signature-removed
     steps:
       - uses: actions/checkout@v4
       - name: Deploy v110 and mutate
@@ -152,6 +153,19 @@ jobs:
               p = root / ".forgeproof" / "issue-998.rpack"
               bundle = json.loads(p.read_text(encoding="utf-8"))
               bundle["issue"]["title"] = str(bundle["issue"].get("title", "")) + " (edited)"
+              p.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+          elif case == "signature-removed":
+              # The v1.2.1 forgery vector: strip the signature and reseal the
+              # (keyless, public) root_digest. This verified GREEN on the v1.2.0
+              # engine; on v1.2.1 it must go red. Guards the re-vendor.
+              import hashlib
+              p = root / ".forgeproof" / "issue-998.rpack"
+              bundle = json.loads(p.read_text(encoding="utf-8"))
+              bundle.pop("signature", None)
+              view = {k: v for k, v in bundle.items()
+                      if k not in ("root_digest", "signature")}
+              canonical = json.dumps(view, sort_keys=True, separators=(",", ":"))
+              bundle["root_digest"] = hashlib.sha256(canonical.encode()).hexdigest()
               p.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
           else:
               raise SystemExit(f"unknown case: {case}")
