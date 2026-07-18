@@ -1,4 +1,4 @@
 repo=ryanjmichie-git/forgeproof-plugin
-ref=v1.2.1
+ref=7d62839ca7adbcd33dc6a21280372e5a1f45ef6a
 path=skills/run/scripts/forgeproof.py
-sha256=008470c3ec1acb26af3e3a735109f64bc6dc5f325b546cc954522fb74a3b563e
+sha256=e0c3a9d1d6414453b60f23d8a50bc7090e1aba5c9a6967cb9570f110c50218c4

@@ -112,6 +112,7 @@ jobs:
           - signature-armor-mutation
           - bundle-field-edit
           - signature-removed
+          - signature-whitespace
     steps:
       - uses: actions/checkout@v4
       - name: Deploy v110 and mutate
@@ -166,6 +167,15 @@ jobs:
                       if k not in ("root_digest", "signature")}
               canonical = json.dumps(view, sort_keys=True, separators=(",", ":"))
               bundle["root_digest"] = hashlib.sha256(canonical.encode()).hexdigest()
+              p.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+          elif case == "signature-whitespace":
+              # v1.2.2: a whitespace-only trailer on a valid signature must turn
+              # verify red. The signature is excluded from root_digest, so no
+              # reseal is needed. GREEN on the v1.2.1 engine (which strip()'d the
+              # signature before the canonical check), RED now — guards the fix.
+              p = root / ".forgeproof" / "issue-998.rpack"
+              bundle = json.loads(p.read_text(encoding="utf-8"))
+              bundle["signature"] = bundle["signature"] + "\n"
               p.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
           else:
               raise SystemExit(f"unknown case: {case}")
